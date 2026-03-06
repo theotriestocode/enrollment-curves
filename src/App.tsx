@@ -774,7 +774,7 @@ export default function App() {
   // Async interface is backend-ready from day one.
   const SUPABASE_URL = "https://aaouobpnfxpgogasrzuj.supabase.co";
   const SUPABASE_KEY = "sb_publishable__v2uWNEHSQHXg9dFPz1cZw_UlLpOWex";
-
+  const OVERRIDES_KEY = "wt:launchDateOverrides";
   const storage = useMemo(
     () => ({
       async load() {
