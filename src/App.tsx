@@ -239,65 +239,27 @@ function cleanUrl(raw) {
   } catch { return "Unattributed"; }
 }
 
-// ── Channel classifier ───────────────────────────────────────────────────────
-// Maps a clean URL to a broad channel label for aggregated view.
-// Uses utm_medium as the primary signal, with utm_content as tiebreaker.
-function classifyChannel(url) {
-  if (!url || url === "Unattributed") return "Unattributed";
-  try {
-    const u = new URL(url.startsWith("http") ? url : "https://x.com" + url);
-    const med = (u.searchParams.get("utm_medium") || "").toLowerCase();
-    const content = (u.searchParams.get("utm_content") || "").toLowerCase();
-    if (!med) return "Unattributed";
-    if (med.includes("airbo")) return "Airbo";
-    if (med.includes("webinar")) return "Webinar";
-    if (med.includes("dm") || med.includes("direct_mail") || med.includes("postcard") ||
-        content.includes("letter") || content.includes("snap") || content.includes("postcard")) return "Direct Mail";
-    if (med.includes("email") || med.includes("oe")) return "Email";
-    if (med.includes("banner")) return "Other";
-    if (med.includes("onsite") || med.includes("flyer")) return "Onsite";
-    return "Other";
-  } catch { return "Other"; }
-}
-
 // ── Build touchpoints ────────────────────────────────────────────────────────
-// groupBy: "url" = one row per distinct clean URL
-//          "channel" = aggregate URLs into broad channel buckets
+// Groups by CLEAN URL (one row per distinct URL after stripping noise params).
 // urlRows: [date, raw_url, count]  — all sources now use this format
 // launchDates: map of cleanUrl -> earliest LP visit date for that URL
-function buildTouchpoints(urlRows, yr, launchDates, groupBy = "url") {
+function buildTouchpoints(urlRows, yr, launchDates) {
   // First pass: bucket all rows by cleanUrl regardless of year
-  const allByUrl = {};
+  const all = {};
   (urlRows || []).forEach(([ds, url, n]) => {
     const key = cleanUrl(url);
-    if (!allByUrl[key]) allByUrl[key] = {};
-    allByUrl[key][ds] = (allByUrl[key][ds] || 0) + n;
+    if (!all[key]) all[key] = {};
+    all[key][ds] = (all[key][ds] || 0) + n;
   });
 
-  // Resolve launch date per URL and filter to launch year
-  const urlsInYear = {};
-  Object.entries(allByUrl).forEach(([urlKey, dm]) => {
+  // Determine launch date per URL, then filter to only URLs whose launch year matches yr
+  const m = {};
+  Object.entries(all).forEach(([urlKey, dm]) => {
     const dates = Object.keys(dm).sort();
     const ld = (launchDates && launchDates[urlKey]) || dates[0];
-    if (parseInt(ld.slice(0, 4), 10) !== yr) return;
-    urlsInYear[urlKey] = { dm, ld };
+    if (parseInt(ld.slice(0, 4), 10) !== yr) return; // filter by launch year
+    m[urlKey] = { dm, ld };
   });
-
-  // If groupBy=channel, merge URLs into channel buckets
-  // Each channel's launch date = earliest URL launch date in that channel
-  const m = {};
-  if (groupBy === "channel") {
-    Object.entries(urlsInYear).forEach(([urlKey, { dm, ld }]) => {
-      const ch = classifyChannel(urlKey);
-      if (!m[ch]) m[ch] = { dm: {}, ld };
-      else if (ld < m[ch].ld) m[ch].ld = ld; // take earliest launch
-      Object.entries(dm).forEach(([ds, n]) => {
-        m[ch].dm[ds] = (m[ch].dm[ds] || 0) + n;
-      });
-    });
-  } else {
-    Object.entries(urlsInYear).forEach(([urlKey, v]) => { m[urlKey] = v; });
-  }
 
   return Object.entries(m).map(([urlKey, { dm, ld }]) => {
     const dates = Object.keys(dm).sort();
@@ -425,11 +387,48 @@ export default function App() {
   const [partner, setPartner] = useState("sisc");
   const [yr, setYr] = useState(2025);
   const [source, setSource] = useState("sched");
-  const [groupBy, setGroupBy] = useState("url");
 
   // phData mirrors PARTNER_DATA shape but lp_url is overwritten by PostHog live data
   const [phData, setPhData] = useState(PARTNER_DATA);
   const [phStatus, setPhStatus] = useState("idle"); // "idle" | "loading" | "ok" | "error"
+
+  // ── Storage adapter ─────────────────────────────────────────────────────────
+  // Swap load()/save() when going team-wide (Supabase, Vercel KV, etc.)
+  // Async interface is backend-ready from day one.
+  const OVERRIDES_KEY = "wt:launchDateOverrides";
+  const storage = useMemo(() => ({
+    async load(key) {
+      try {
+        const raw = localStorage.getItem(key);
+        return raw ? JSON.parse(raw) : null;
+      } catch { return null; }
+    },
+    async save(key, value) {
+      try { localStorage.setItem(key, JSON.stringify(value)); }
+      catch (e) { console.error("Storage save failed:", e); }
+    },
+  }), []);
+
+  // User-editable launch date overrides: { [cleanUrl]: "YYYY-MM-DD" }
+  const [launchDateOverrides, setLaunchDateOverrides] = useState({});
+  // Inline edit state
+  const [editingUrl, setEditingUrl] = useState(null);
+  const [editingValue, setEditingValue] = useState("");
+
+  // Load persisted overrides on mount
+  useEffect(() => {
+    storage.load(OVERRIDES_KEY).then(parsed => {
+      if (parsed && typeof parsed === "object") setLaunchDateOverrides(parsed);
+    });
+  }, [storage]);
+
+  const updateOverrides = useCallback((updater) => {
+    setLaunchDateOverrides(prev => {
+      const next = typeof updater === "function" ? updater(prev) : updater;
+      storage.save(OVERRIDES_KEY, next);
+      return next;
+    });
+  }, [storage]);
 
   const fetchFromPostHog = useCallback(async () => {
     setPhStatus("loading");
@@ -480,8 +479,10 @@ export default function App() {
   useEffect(() => { fetchFromPostHog(); }, [fetchFromPostHog]);
 
   const launchDates = useMemo(() => {
-    return getLaunchDates(partner, phData);
-  }, [partner, phData]);
+    const base = getLaunchDates(partner, phData);
+    // Apply user overrides on top of auto-detected dates
+    return { ...base, ...launchDateOverrides };
+  }, [partner, phData, launchDateOverrides]);
 
   const touchpoints = useMemo(() => {
     // All sources now use [date, url, count] format — pick the right array
@@ -492,8 +493,8 @@ export default function App() {
       const urlKey = source + "_url"; // sched_url or comp_url
       urlRows = phData[partner]?.[urlKey] || [];
     }
-    return buildTouchpoints(urlRows, yr, launchDates, groupBy);
-  }, [partner, source, yr, launchDates, phData, groupBy]);
+    return buildTouchpoints(urlRows, yr, launchDates);
+  }, [partner, source, yr, launchDates, phData]);
 
 
   const partnerLabel = PARTNER_CONFIG[partner]?.label;
@@ -543,13 +544,6 @@ export default function App() {
 
         {divider}
 
-        {/* Group by */}
-        {[["url","By URL"],["channel","By Channel"]].map(([v, l]) => (
-          <button key={v} onClick={() => setGroupBy(v)} style={btnStyle(groupBy === v, "#6d4c9e")}>{l}</button>
-        ))}
-
-        {divider}
-
         {/* Year */}
         {[2024, 2025, 2026].map(y => (
           <button key={y} onClick={() => setYr(y)} style={btnStyle(yr === y, "#333")}>{y}</button>
@@ -563,7 +557,7 @@ export default function App() {
         <table style={{ borderCollapse: "collapse", fontSize: 12, background: "#fff", borderRadius: 8, overflow: "hidden", boxShadow: "0 1px 4px rgba(0,0,0,.08)", minWidth: "100%" }}>
           <thead>
             <tr style={{ background: "#f0f0f0" }}>
-              <th style={{ padding: "7px 10px", textAlign: "left", fontWeight: 600, borderBottom: "1px solid #ddd", whiteSpace: "nowrap", minWidth: 280 }}>{groupBy === "channel" ? "Channel" : "URL"}</th>
+              <th style={{ padding: "7px 10px", textAlign: "left", fontWeight: 600, borderBottom: "1px solid #ddd", whiteSpace: "nowrap", minWidth: 280 }}>URL</th>
               <th style={{ padding: "7px 10px", textAlign: "left", fontWeight: 600, borderBottom: "1px solid #ddd", whiteSpace: "nowrap" }}>Launch Date</th>
               <th style={{ padding: "7px 10px", textAlign: "right", fontWeight: 600, borderBottom: "1px solid #ddd", whiteSpace: "nowrap" }}>TOTAL</th>
               {[1,2,3,4,5,6,7,8].map(w => (
@@ -578,7 +572,54 @@ export default function App() {
                   <td style={{ padding: "6px 10px", color: "#333", fontSize: 11, fontFamily: "monospace", wordBreak: "break-all", maxWidth: 380 }}>
                     {t.url}
                   </td>
-                  <td style={{ padding: "6px 10px", color: "#555", whiteSpace: "nowrap" }}>{t.ld}</td>
+                  <td style={{ padding: "4px 6px", color: "#555", whiteSpace: "nowrap", minWidth: 120 }}>
+                    {editingUrl === t.url ? (
+                      <input
+                        type="date"
+                        value={editingValue}
+                        autoFocus
+                        onChange={e => setEditingValue(e.target.value)}
+                        onBlur={() => {
+                          if (editingValue && /^\d{4}-\d{2}-\d{2}$/.test(editingValue)) {
+                            updateOverrides(prev => ({ ...prev, [t.url]: editingValue }));
+                          }
+                          setEditingUrl(null);
+                        }}
+                        onKeyDown={e => {
+                          if (e.key === "Enter") {
+                            if (editingValue && /^\d{4}-\d{2}-\d{2}$/.test(editingValue)) {
+                              updateOverrides(prev => ({ ...prev, [t.url]: editingValue }));
+                            }
+                            setEditingUrl(null);
+                          }
+                          if (e.key === "Escape") setEditingUrl(null);
+                        }}
+                        style={{ fontSize: 12, padding: "2px 4px", borderRadius: 4, border: "1px solid #4f86f7", outline: "none", width: 130 }}
+                      />
+                    ) : (
+                      <span
+                        title="Click to edit launch date"
+                        onClick={() => { setEditingUrl(t.url); setEditingValue(t.ld); }}
+                        style={{
+                          cursor: "text",
+                          display: "inline-flex",
+                          alignItems: "center",
+                          gap: 4,
+                          padding: "2px 6px",
+                          borderRadius: 4,
+                          border: "1px solid transparent",
+                          transition: "border-color 0.15s",
+                        }}
+                        onMouseEnter={e => e.currentTarget.style.borderColor = "#cce0ff"}
+                        onMouseLeave={e => e.currentTarget.style.borderColor = "transparent"}
+                      >
+                        {t.ld}
+                        {launchDateOverrides[t.url] && (
+                          <span title="Date manually overridden" style={{ fontSize: 9, color: "#4f86f7", fontWeight: 700, letterSpacing: 0.5 }}>✎</span>
+                        )}
+                      </span>
+                    )}
+                  </td>
                   <td style={{ padding: "6px 10px", fontWeight: 700, textAlign: "right", whiteSpace: "nowrap" }}>{t.tot.toLocaleString()}</td>
                   {[1,2,3,4,5,6,7,8].map(w => {
                     const wkEntry = t.wk[w - 1];
@@ -605,9 +646,19 @@ export default function App() {
           </tbody>
         </table>
       </div>
-      <p style={{ fontSize: 11, color: "#999", marginTop: 8 }}>
-        {groupBy === "url" ? "Each row = one distinct clean URL. Launch date = first LP visit for that URL." : "Each row = one channel (DM / Email / Airbo / etc). Launch date = earliest LP visit across all URLs in that channel."} Heatmap intensity = % of row total in that week.
-      </p>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginTop: 8 }}>
+        <p style={{ fontSize: 11, color: "#999", margin: 0 }}>
+          Launch date = first LP visit for that URL. <strong style={{ color: "#666" }}>Click any date to override it.</strong> Heatmap = % of URL total in that week. Each row = one distinct clean URL.
+        </p>
+        {Object.keys(launchDateOverrides).length > 0 && (
+          <button
+            onClick={() => updateOverrides({})}
+            style={{ fontSize: 11, padding: "3px 8px", borderRadius: 4, border: "1px solid #f5a623", background: "#fffbf0", color: "#b07000", cursor: "pointer", whiteSpace: "nowrap", marginLeft: 12 }}
+          >
+            Reset {Object.keys(launchDateOverrides).length} override{Object.keys(launchDateOverrides).length > 1 ? "s" : ""}
+          </button>
+        )}
+      </div>
     </div>
   );
 }
